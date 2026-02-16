@@ -1,0 +1,299 @@
+parameters:
+- name: deployVersion
+  displayName: 'Deploy specific version'
+  type: string
+  default: ''
+
+trigger:
+ branches:
+  include:
+  - 'features/*'
+  - 'features'
+  - 'master'
+  - 'main'
+ paths:
+  exclude:
+  - '*.md'
+  - 'docs/**'
+  - '.gitignore'
+  - 'my_files/**'
+
+pr:
+  branches:
+    include:
+      - master
+      - main
+
+variables:
+- group: general-config
+- group: sonarcloud-config
+- group: peex_01_2025_prod
+- name: dockerfilePath
+  value: '$(Build.SourcesDirectory)/Dockerfile'
+- name: resourceGroupACR
+  value: peex-acr-rg
+- name: containerRegistry
+  value: PeexCiCdWebAppACR
+
+pool: self-hosted-pool
+
+stages:
+ - stage: PrepareApplication
+   displayName: Preparing and Testing
+   jobs:
+    - job: CheckoutAndSetup
+      displayName: Preparing and Testing
+      steps:
+        - checkout: self
+          fetchDepth: 0
+        - task: CmdLine@2
+          displayName: Secret scan (gitleaks)
+          continueOnError: true
+          inputs:
+            script: |
+              docker run --rm -v $(Build.SourcesDirectory):/repo \
+                zricethezav/gitleaks:latest detect --source /repo --verbose
+        - task: UsePythonVersion@0
+          displayName: Install python
+          inputs:
+            versionSpec: '3.8'
+            addToPath: true
+            architecture: 'x64'
+        - task: CmdLine@2
+          displayName: Install Dependencies
+          inputs:
+            script: |
+              sudo apt-get install -y libpq-dev gcc
+              rm -rf venv
+              python -m venv venv
+              source venv/bin/activate
+              pip install -r requirements.txt
+              pip install coverage
+        - task: CmdLine@2
+          displayName: Dependency scan (pip-audit)
+          continueOnError: true
+          inputs:
+            script: |
+              source venv/bin/activate
+              pip install pip-audit
+              pip-audit
+        - task: CmdLine@2
+          displayName: Unit test with coverage
+          continueOnError: true
+          inputs:
+            script: |
+              source venv/bin/activate
+              coverage run -m unittest discover -s tests -p "*.py"
+              test_result=$?
+              coverage xml -o coverage.xml
+              exit $test_result
+        - task: AzureKeyVault@2
+          displayName: 'Get secrets from Key Vault'
+          condition: and(succeeded(), ne(variables['keyVaultName'], ''))
+          inputs:
+            azureSubscription: 'peex-cicd'
+            KeyVaultName: '$(keyVaultName)'
+            SecretsFilter: 'SONAR-TOKEN'
+            RunAsPreJob: false
+        - task: SonarCloudPrepare@4
+          displayName: Prepare SonarCloud Analysis
+          inputs:
+            SonarCloud: '$(sonarCloudConnection)'
+            organization: '$(sonarOrganization)'
+            scannerMode: 'CLI'
+            configMode: 'manual'
+            cliProjectKey: '$(sonarProjectKey)'
+            cliProjectName: '$(sonarProjectName)'
+            cliSources: '.'
+        - task: SonarCloudAnalyze@4
+          displayName: Run SonarCloud Analysis
+        - task: SonarCloudPublish@4
+          displayName: Publish Quality Gate Result
+          inputs:
+            pollingTimeoutSec: '300'
+        - bash: |
+            if [ "$BUILD_REASON" = "PullRequest" ] && [ -n "$PR_ID" ] && [[ "$PR_ID" =~ ^[0-9]+$ ]]; then
+              url="https://sonarcloud.io/api/qualitygates/project_status?projectKey=$(sonarProjectKey)&pullRequest=$PR_ID"
+            else
+              url="https://sonarcloud.io/api/qualitygates/project_status?projectKey=$(sonarProjectKey)&branch=$SOURCE_BRANCH"
+            fi
+            echo "Build Reason: $BUILD_REASON"
+            echo "PR ID: $PR_ID"
+            echo "Source Branch: $SOURCE_BRANCH"
+            echo "API URL: $url"
+            curl -s -u $SONAR_TOKEN: "$url" > /tmp/qg.json
+            cat /tmp/qg.json
+            status=$(python3 -c "import json; f=open('/tmp/qg.json'); print(json.load(f)['projectStatus']['status'])")
+            echo "Quality Gate Status: $status"
+            if [ "$status" != "OK" ]; then
+              echo "##[error]Quality Gate FAILED!"
+              exit 1
+            fi
+            echo "##[section]Quality Gate PASSED!"
+          displayName: Check Quality Gate Status
+          env:
+            SONAR_TOKEN: $(SONAR_TOKEN)
+            BUILD_REASON: $(Build.Reason)
+            PR_ID: $(System.PullRequest.PullRequestId)
+            SOURCE_BRANCH: $(Build.SourceBranchName)
+
+ - stage: BuildAndPushContainer
+   displayName: Build and Push
+   dependsOn: PrepareApplication
+   condition: and(succeeded(), or(eq(variables['Build.SourceBranchName'], 'master'), eq(variables['Build.SourceBranchName'], 'main')))
+   jobs:
+    - job: BuildAndPush
+      displayName: Build and Push
+      steps:
+       - task: AzureCLI@2
+         displayName: 'Build and Push Image'
+         inputs:
+           azureSubscription: 'peex-cicd'
+           scriptType: 'bash'
+           scriptLocation: 'inlineScript'
+           inlineScript: |
+             VERSION="$(Major).$(Minor).$(Build.BuildId)"
+             REGISTRY="peexcicdwebappacr.azurecr.io"
+             IMAGE="peex_01_2025"
+             
+             echo "##[section]Building image with version: $VERSION"
+             
+             az acr login --name peexcicdwebappacr
+             
+             docker build -t $REGISTRY/$IMAGE:$VERSION \
+                          -t $REGISTRY/$IMAGE:$(Build.BuildId) \
+                          -t $REGISTRY/$IMAGE:latest \
+                          -f $(Build.SourcesDirectory)/Dockerfile $(Build.SourcesDirectory)
+             
+             echo "##[section]Pushing tags: $VERSION, $(Build.BuildId), latest"
+             
+             docker push $REGISTRY/$IMAGE:$VERSION
+             docker push $REGISTRY/$IMAGE:$(Build.BuildId)
+             docker push $REGISTRY/$IMAGE:latest
+       - task: AzureCLI@2
+         displayName: 'Container scan (Trivy)'
+         continueOnError: true
+         inputs:
+           azureSubscription: 'peex-cicd'
+           scriptType: 'bash'
+           scriptLocation: 'inlineScript'
+           inlineScript: |
+             az acr login --name peexcicdwebappacr
+             VERSION="$(Major).$(Minor).$(Build.BuildId)"
+             docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+               aquasec/trivy:latest image --no-progress --exit-code 1 \
+               peexcicdwebappacr.azurecr.io/peex_01_2025:$VERSION
+       - task: AzureCLI@2
+         displayName: 'Cleanup old images'
+         inputs:
+           azureSubscription: 'peex-cicd'
+           scriptType: 'bash'
+           scriptLocation: 'inlineScript'
+           inlineScript: |
+             TOTAL=$(az acr repository show-manifests --name peexcicdwebappacr --repository peex_01_2025 --query "length(@)" -o tsv)
+             CUTOFF_DATE=$(date -d "-$(retentionDays) days" +%Y-%m-%dT%H:%M:%SZ)
+             NEW_COUNT=$(az acr repository show-manifests --name peexcicdwebappacr --repository peex_01_2025 --query "[?timestamp > '$CUTOFF_DATE'] | length(@)" -o tsv)
+             OLD_COUNT=$((TOTAL - NEW_COUNT))
+             
+             echo "Total images: $TOTAL"
+             echo "New images (< $(retentionDays) days): $NEW_COUNT"
+             echo "Old images (>= $(retentionDays) days): $OLD_COUNT"
+             echo "Minimum to keep: $(retentionCount)"
+             
+             if [ "$TOTAL" -le "$(retentionCount)" ]; then
+               echo "##[section]Skipping: only $TOTAL images (minimum $(retentionCount))"
+             elif [ "$NEW_COUNT" -ge "$(retentionCount)" ]; then
+               echo "##[section]Deleting ALL old images ($OLD_COUNT)"
+               az acr run \
+                 --cmd "acr purge --filter 'peex_01_2025:.*' --ago $(retentionDays)d --untagged" \
+                 --registry peexcicdwebappacr \
+                 /dev/null || true
+             else
+               KEEP_OLD=$(($(retentionCount) - NEW_COUNT))
+               echo "##[section]Keeping $KEEP_OLD old images to maintain minimum $(retentionCount)"
+               az acr run \
+                 --cmd "acr purge --filter 'peex_01_2025:.*' --ago $(retentionDays)d --keep $KEEP_OLD --untagged" \
+                 --registry peexcicdwebappacr \
+                 /dev/null || true
+             fi
+
+ - stage: DeployToDev
+   displayName: Deploy to Dev
+   dependsOn: BuildAndPushContainer
+   condition: and(succeeded(), or(eq(variables['Build.SourceBranchName'], 'master'), eq(variables['Build.SourceBranchName'], 'main')))
+   jobs:
+    - deployment: DeployToDev
+      displayName: Deploy to Dev
+      environment: dev
+      variables:
+       - group: peex_01_2025_dev
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - task: AzureCLI@2
+              displayName: Deploy to WebAPP
+              inputs:
+                azureSubscription: 'peex-cicd'
+                scriptType: 'bash'
+                scriptLocation: 'inlineScript'
+                inlineScript: |
+                  if [ -n "${{ parameters.deployVersion }}" ]; then
+                    DEPLOY_VERSION="${{ parameters.deployVersion }}"
+                    echo "##[section]Using specified version: $DEPLOY_VERSION"
+                  else
+                    DEPLOY_VERSION="$(Major).$(Minor).$(Build.BuildId)"
+                    echo "##[section]Using current build version: $DEPLOY_VERSION"
+                  fi
+                  ACR_USERNAME=$(az acr credential show --name peexcicdwebappacr --query username -o tsv)
+                  ACR_PASSWORD=$(az acr credential show --name peexcicdwebappacr --query "passwords[0].value" -o tsv)
+                  az webapp config container set \
+                    --name $(webapp) \
+                    --resource-group $(resourceGroupWebApp) \
+                    --container-image-name peexcicdwebappacr.azurecr.io/peex_01_2025:$DEPLOY_VERSION \
+                    --container-registry-url https://peexcicdwebappacr.azurecr.io \
+                    --container-registry-user $ACR_USERNAME \
+                    --container-registry-password $ACR_PASSWORD
+                  az webapp restart --name $(webapp) --resource-group $(resourceGroupWebApp)
+                  echo "##[section]Successfully deployed version: $DEPLOY_VERSION"
+
+ - stage: DeployToProd
+   displayName: Deploy to Prod
+   dependsOn: DeployToDev
+   condition: and(succeeded(), or(eq(variables['Build.SourceBranchName'], 'master'), eq(variables['Build.SourceBranchName'], 'main')))
+   jobs:
+    - deployment: DeployToProd
+      displayName: Deploy to Prod
+      environment: prod
+      variables:
+       - group: peex_01_2025_prod
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - task: AzureCLI@2
+              displayName: Deploy to WebAPP
+              inputs:
+                azureSubscription: 'peex-cicd'
+                scriptType: 'bash'
+                scriptLocation: 'inlineScript'
+                inlineScript: |
+                  if [ -n "${{ parameters.deployVersion }}" ]; then
+                    DEPLOY_VERSION="${{ parameters.deployVersion }}"
+                    echo "##[section]Using specified version: $DEPLOY_VERSION"
+                  else
+                    DEPLOY_VERSION="$(Major).$(Minor).$(Build.BuildId)"
+                    echo "##[section]Using current build version: $DEPLOY_VERSION"
+                  fi
+                  ACR_USERNAME=$(az acr credential show --name peexcicdwebappacr --query username -o tsv)
+                  ACR_PASSWORD=$(az acr credential show --name peexcicdwebappacr --query "passwords[0].value" -o tsv)
+                  az webapp config container set \
+                    --name $(webapp) \
+                    --resource-group $(resourceGroupWebApp) \
+                    --container-image-name peexcicdwebappacr.azurecr.io/peex_01_2025:$DEPLOY_VERSION \
+                    --container-registry-url https://peexcicdwebappacr.azurecr.io \
+                    --container-registry-user $ACR_USERNAME \
+                    --container-registry-password $ACR_PASSWORD
+                  az webapp restart --name $(webapp) --resource-group $(resourceGroupWebApp)
+                  echo "##[section]Successfully deployed version: $DEPLOY_VERSION"
+
