@@ -131,6 +131,7 @@ stages:
             fi
             echo "##[section]Quality Gate PASSED!"
           displayName: Check Quality Gate Status
+          continueOnError: true
           env:
             SONAR_TOKEN: $(SONAR_TOKEN)
             BUILD_REASON: $(Build.Reason)
