@@ -126,7 +126,7 @@ stages:
             status=$(python3 -c "import json; f=open('/tmp/qg.json'); print(json.load(f)['projectStatus']['status'])")
             echo "Quality Gate Status: $status"
             if [ "$status" != "OK" ]; then
-              echo "##[error]Quality Gate FAILED!"
+              echo "##[error]Quality Gate FAILED!!"
               exit 1
             fi
             echo "##[section]Quality Gate PASSED!"
